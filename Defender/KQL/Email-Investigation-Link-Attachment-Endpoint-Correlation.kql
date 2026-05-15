@@ -1,0 +1,239 @@
+// =================================================================================================
+// Microsoft Defender XDR Advanced Hunting
+// Analyse von verdächtigen / schadhaften E-Mails mit URLs und Anhängen
+//
+// Titel: Microsoft Defender XDR – Email Investigation: Link, Attachment and Endpoint Correlation
+// Autor:  Florian Aschbichler
+// Firma:  Skylink GmbH
+// Version: 1.0
+// Stand:   15.05.2026
+//
+// Ziel:
+// - Ermitteln, welche verdächtigen E-Mails im definierten Zeitraum eingegangen sind
+// - Prüfen, ob enthaltene Links angeklickt wurden
+// - Prüfen, ob Safe Links einen Click erlaubt/blockiert hat
+// - Anhänge inkl. Hashwerte und Threat-Verdicts anzeigen
+// - Prüfen, ob ein E-Mail-Anhang anhand des SHA256-Hashs auf einem Endpoint aufgetreten ist
+//
+// Wichtige Tabellen:
+// - EmailEvents: Basisinformationen zur E-Mail-Zustellung
+// - UrlClickEvents: Safe Links / URL-Klickereignisse
+// - EmailAttachmentInfo: Informationen zu E-Mail-Anhängen
+// - DeviceFileEvents: Dateiaktivitäten auf MDE-onboarded Endpoints
+//
+// Einschränkungen:
+// - "E-Mail geöffnet" ist mit dieser Query nicht beweisbar.
+// - "Anhang geöffnet" ist nicht direkt beweisbar, aber "Anhang am Endpoint gesehen" ist prüfbar.
+// - DeviceFileEvents liefert nur Daten für MDE-onboarded Geräte.
+// - SHA256 ist nicht in jedem Fall vollständig befüllt.
+// =================================================================================================
+
+
+// -------------------------------------------------------------------------------------------------
+// 1. Analysezeitraum definieren
+// -------------------------------------------------------------------------------------------------
+
+let StartTime = datetime(2026-01-01 00:00:00);
+let EndTime   = datetime(2026-05-15 23:59:59);
+
+
+// -------------------------------------------------------------------------------------------------
+// 2. Verdächtige E-Mails identifizieren
+//
+// Diese Teilabfrage bildet die Basis der Analyse.
+// Es werden E-Mails gesucht, die entweder:
+// - von einer definierten Absender-Domain kommen,
+// - von einer definierten Absenderadresse kommen,
+// - oder von Microsoft als Phish, Malware oder Spam klassifiziert wurden.
+//
+// Hinweis:
+// Die Platzhalter "example.com" und "sender@example.com" müssen durch reale Werte ersetzt werden.
+// Alternativ kann der Filter erweitert oder entfernt werden, wenn allgemein alle verdächtigen
+// Nachrichten im Zeitraum analysiert werden sollen.
+// -------------------------------------------------------------------------------------------------
+
+let SuspiciousEmails =
+    EmailEvents
+    | where Timestamp between (StartTime .. EndTime)
+    | where SenderFromDomain in~ (dynamic(["example.com"]))
+        or SenderFromAddress in~ (dynamic(["sender@example.com"]))
+        or ThreatTypes has_any ("Phish", "Malware", "Spam")
+    | project
+        MailTime = Timestamp,
+        NetworkMessageId,
+        InternetMessageId,
+        RecipientEmailAddress,
+        SenderFromAddress,
+        Subject,
+        DeliveryAction,
+        DeliveryLocation,
+        ThreatTypes,
+        DetectionMethods,
+        AttachmentCount,
+        UrlCount;
+
+
+// -------------------------------------------------------------------------------------------------
+// 3. URL-Klicks zu den verdächtigen E-Mails ermitteln
+//
+// Diese Teilabfrage aggregiert alle Safe-Links-Klickereignisse pro E-Mail.
+// Die Verknüpfung erfolgt später über die NetworkMessageId.
+//
+// Ergebnisfelder:
+// - LinkClicked: Gibt an, ob mindestens ein Link geklickt wurde.
+// - FirstClickTime: Zeitpunkt des ersten bekannten Klicks.
+// - ClickActions: Safe-Links-Aktionen, z. B. erlaubt oder blockiert.
+// - ClickedUrls: Liste der geklickten URLs.
+// - ClickThroughObserved: Gibt an, ob ein Benutzer trotz Warnung weitergeklickt hat.
+//
+// Hinweis:
+// Das Suchfenster wird um 7 Tage nach EndTime erweitert, da Benutzer Links auch zeitversetzt
+// nach Empfang der E-Mail anklicken können.
+// -------------------------------------------------------------------------------------------------
+
+let LinkClicks =
+    UrlClickEvents
+    | where Timestamp between (StartTime .. EndTime + 7d)
+    | summarize
+        LinkClicked = count() > 0,
+        FirstClickTime = min(Timestamp),
+        ClickActions = make_set(ActionType, 20),
+        ClickedUrls = make_set(Url, 20),
+        ClickThroughObserved = max(toint(IsClickedThrough)) == 1
+      by NetworkMessageId, AccountUpn;
+
+
+// -------------------------------------------------------------------------------------------------
+// 4. Anhänge der verdächtigen E-Mails aggregieren
+//
+// Diese Teilabfrage sammelt Informationen zu Anhängen der zuvor identifizierten E-Mails.
+//
+// Ergebnisfelder:
+// - AttachmentNames: Namen der Anhänge
+// - AttachmentHashes: SHA256-Hashwerte der Anhänge
+// - AttachmentThreatTypes: Malware-/Phishing-/Spam-Bewertung für Anhänge
+// - AttachmentDetectionMethods: Erkennungsmethoden der E-Mail-Security-Engine
+//
+// Die Verknüpfung erfolgt über:
+// - NetworkMessageId
+// - RecipientEmailAddress
+// -------------------------------------------------------------------------------------------------
+
+let AttachmentHashes =
+    EmailAttachmentInfo
+    | join kind=inner SuspiciousEmails on NetworkMessageId, RecipientEmailAddress
+    | summarize
+        AttachmentNames = make_set(FileName, 20),
+        AttachmentHashes = make_set(SHA256, 20),
+        AttachmentThreatTypes = make_set(ThreatTypes, 20),
+        AttachmentDetectionMethods = make_set(DetectionMethods, 20)
+      by NetworkMessageId, RecipientEmailAddress;
+
+
+// -------------------------------------------------------------------------------------------------
+// 5. Prüfen, ob Anhang-Hashes auf Endpoints aufgetreten sind
+//
+// Diese Teilabfrage korreliert die SHA256-Hashes aus EmailAttachmentInfo mit DeviceFileEvents.
+// Dadurch kann geprüft werden, ob ein Anhang auf einem MDE-onboarded Client tatsächlich
+// als Datei aufgetreten ist.
+//
+// Ergebnisfelder:
+// - AttachmentSeenOnEndpoint: Gibt an, ob der Anhang-Hash auf einem Endpoint gesehen wurde.
+// - EndpointFirstSeen: Erster Zeitpunkt, zu dem der Hash auf einem Endpoint beobachtet wurde.
+// - Devices: Geräte, auf denen der Hash gesehen wurde.
+// - EndpointActions: Dateiaktionen, z. B. FileCreated, FileModified etc.
+//
+// Wichtig:
+// Ein Treffer bedeutet nicht automatisch, dass der Anhang geöffnet wurde.
+// Es bedeutet zunächst nur, dass der Datei-Hash auf dem Endpoint beobachtet wurde.
+// -------------------------------------------------------------------------------------------------
+
+let EndpointAttachmentSeen =
+    EmailAttachmentInfo
+    | join kind=inner SuspiciousEmails on NetworkMessageId, RecipientEmailAddress
+    | where isnotempty(SHA256)
+    | distinct NetworkMessageId, RecipientEmailAddress, SHA256
+    | join kind=inner (
+        DeviceFileEvents
+        | where Timestamp between (StartTime .. EndTime + 7d)
+        | where isnotempty(SHA256)
+        | project
+            EndpointSeenTime = Timestamp,
+            DeviceName,
+            SHA256,
+            InitiatingProcessAccountUpn,
+            ActionType
+    ) on SHA256
+    | summarize
+        AttachmentSeenOnEndpoint = count() > 0,
+        EndpointFirstSeen = min(EndpointSeenTime),
+        Devices = make_set(DeviceName, 20),
+        EndpointActions = make_set(ActionType, 20)
+      by NetworkMessageId, RecipientEmailAddress;
+
+
+// -------------------------------------------------------------------------------------------------
+// 6. Finale Ergebnisansicht
+//
+// Die einzelnen Teilabfragen werden zusammengeführt:
+// - SuspiciousEmails als Basistabelle
+// - LinkClicks für Link-Interaktionen
+// - AttachmentHashes für Anhangsinformationen
+// - EndpointAttachmentSeen für Endpoint-Nachweise
+//
+// leftouter join wird verwendet, damit E-Mails auch dann angezeigt werden,
+// wenn keine Link-Klicks oder keine Endpoint-Treffer vorhanden sind.
+// -------------------------------------------------------------------------------------------------
+
+SuspiciousEmails
+| join kind=leftouter LinkClicks on NetworkMessageId
+| join kind=leftouter AttachmentHashes on NetworkMessageId, RecipientEmailAddress
+| join kind=leftouter EndpointAttachmentSeen on NetworkMessageId, RecipientEmailAddress
+
+// -------------------------------------------------------------------------------------------------
+// 7. Boolean-Felder normalisieren
+//
+// Wenn keine passenden Datensätze aus den Join-Tabellen gefunden werden,
+// entstehen leere Werte. Diese werden hier auf "false" gesetzt,
+// damit die Ergebnisinterpretation einfacher ist.
+// -------------------------------------------------------------------------------------------------
+
+| extend
+    LinkClicked = coalesce(LinkClicked, false),
+    ClickThroughObserved = coalesce(ClickThroughObserved, false),
+    AttachmentSeenOnEndpoint = coalesce(AttachmentSeenOnEndpoint, false)
+
+// -------------------------------------------------------------------------------------------------
+// 8. Relevante Spalten für die Analyse ausgeben
+// -------------------------------------------------------------------------------------------------
+
+| project
+    MailTime,
+    RecipientEmailAddress,
+    SenderFromAddress,
+    Subject,
+    DeliveryAction,
+    DeliveryLocation,
+    ThreatTypes,
+    DetectionMethods,
+    AttachmentCount,
+    UrlCount,
+    LinkClicked,
+    FirstClickTime,
+    ClickActions,
+    ClickThroughObserved,
+    AttachmentNames,
+    AttachmentThreatTypes,
+    AttachmentDetectionMethods,
+    AttachmentSeenOnEndpoint,
+    EndpointFirstSeen,
+    Devices,
+    EndpointActions,
+    NetworkMessageId,
+    InternetMessageId
+
+// -------------------------------------------------------------------------------------------------
+// 9. Sortierung: Neueste E-Mails zuerst
+// -------------------------------------------------------------------------------------------------
+
+| order by MailTime desc
