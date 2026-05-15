@@ -35,28 +35,11 @@
 let StartTime = datetime(2026-01-01 00:00:00);
 let EndTime   = datetime(2026-05-15 23:59:59);
 
-
-// -------------------------------------------------------------------------------------------------
-// 2. Suchparameter definieren
-//
-// Die Werte müssen bei Bedarf kundenspezifisch angepasst werden.
-// Wenn keine spezifische Domain oder Adresse bekannt ist, können die Platzhalter bestehen bleiben.
-// Dann greifen weiterhin die ThreatTypes "Phish", "Malware" und "Spam".
-// -------------------------------------------------------------------------------------------------
-
-let SenderDomains = dynamic(["example.com"]);
-let SenderAddresses = dynamic(["sender@example.com"]);
-
-
-// -------------------------------------------------------------------------------------------------
-// 3. Verdächtige E-Mails identifizieren
-// -------------------------------------------------------------------------------------------------
-
 let SuspiciousEmails =
     EmailEvents
     | where Timestamp between (StartTime .. EndTime)
-    | where SenderFromDomain in~ (SenderDomains)
-        or SenderFromAddress in~ (SenderAddresses)
+    | where SenderFromDomain in~ (dynamic(["example.com"]))
+        or SenderFromAddress in~ (dynamic(["sender@example.com"]))
         or ThreatTypes has_any ("Phish", "Malware", "Spam")
     | project
         MailTime = Timestamp,
@@ -71,14 +54,6 @@ let SuspiciousEmails =
         DetectionMethods,
         AttachmentCount,
         UrlCount;
-
-
-// -------------------------------------------------------------------------------------------------
-// 4. URL-Klicks zu den verdächtigen E-Mails ermitteln
-//
-// Das Suchfenster wird um 7 Tage erweitert, da Benutzer Links auch später anklicken können.
-// -------------------------------------------------------------------------------------------------
-
 let LinkClicks =
     UrlClickEvents
     | where Timestamp between (StartTime .. EndTime + 7d)
@@ -88,13 +63,7 @@ let LinkClicks =
         ClickActions = make_set(ActionType, 20),
         ClickedUrls = make_set(Url, 20),
         ClickThroughObserved = max(toint(IsClickedThrough)) == 1
-      by NetworkMessageId;
-
-
-// -------------------------------------------------------------------------------------------------
-// 5. Anhänge der verdächtigen E-Mails aggregieren
-// -------------------------------------------------------------------------------------------------
-
+      by NetworkMessageId, AccountUpn;
 let AttachmentHashes =
     EmailAttachmentInfo
     | join kind=inner SuspiciousEmails on NetworkMessageId, RecipientEmailAddress
@@ -104,18 +73,6 @@ let AttachmentHashes =
         AttachmentThreatTypes = make_set(ThreatTypes, 20),
         AttachmentDetectionMethods = make_set(DetectionMethods, 20)
       by NetworkMessageId, RecipientEmailAddress;
-
-
-// -------------------------------------------------------------------------------------------------
-// 6. Prüfen, ob Anhang-Hashes auf Endpoints aufgetreten sind
-//
-// Ein Treffer bedeutet:
-// - Der SHA256-Hash eines E-Mail-Anhangs wurde auf einem MDE-onboarded Endpoint beobachtet.
-//
-// Ein Treffer bedeutet nicht automatisch:
-// - dass der Benutzer den Anhang aktiv geöffnet hat.
-// -------------------------------------------------------------------------------------------------
-
 let EndpointAttachmentSeen =
     EmailAttachmentInfo
     | join kind=inner SuspiciousEmails on NetworkMessageId, RecipientEmailAddress
@@ -125,12 +82,7 @@ let EndpointAttachmentSeen =
         DeviceFileEvents
         | where Timestamp between (StartTime .. EndTime + 7d)
         | where isnotempty(SHA256)
-        | project
-            EndpointSeenTime = Timestamp,
-            DeviceName,
-            SHA256,
-            InitiatingProcessAccountUpn,
-            ActionType
+        | project EndpointSeenTime = Timestamp, DeviceName, SHA256, InitiatingProcessAccountUpn, ActionType
     ) on SHA256
     | summarize
         AttachmentSeenOnEndpoint = count() > 0,
@@ -138,12 +90,6 @@ let EndpointAttachmentSeen =
         Devices = make_set(DeviceName, 20),
         EndpointActions = make_set(ActionType, 20)
       by NetworkMessageId, RecipientEmailAddress;
-
-
-// -------------------------------------------------------------------------------------------------
-// 7. Finale Ergebnisansicht
-// -------------------------------------------------------------------------------------------------
-
 SuspiciousEmails
 | join kind=leftouter LinkClicks on NetworkMessageId
 | join kind=leftouter AttachmentHashes on NetworkMessageId, RecipientEmailAddress
@@ -168,7 +114,6 @@ SuspiciousEmails
     ClickActions,
     ClickThroughObserved,
     AttachmentNames,
-    AttachmentHashes,
     AttachmentThreatTypes,
     AttachmentDetectionMethods,
     AttachmentSeenOnEndpoint,
