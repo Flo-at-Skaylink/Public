@@ -1,0 +1,90 @@
+let StartTime = datetime(2026-01-01 00:00:00);
+let EndTime   = datetime(2026-05-15 23:59:59);
+let SuspiciousEmails =
+    EmailEvents
+    | where Timestamp between (StartTime .. EndTime)
+    | where SenderFromDomain in~ (dynamic(["example.com"]))
+        or SenderFromAddress in~ (dynamic(["sender@example.com"]))
+        or ThreatTypes has_any ("Phish", "Malware", "Spam")
+    | project
+        MailTime = Timestamp,
+        NetworkMessageId,
+        InternetMessageId,
+        RecipientEmailAddress,
+        SenderFromAddress,
+        Subject,
+        DeliveryAction,
+        DeliveryLocation,
+        ThreatTypes,
+        DetectionMethods,
+        AttachmentCount,
+        UrlCount;
+let LinkClicks =
+    UrlClickEvents
+    | where Timestamp between (StartTime .. EndTime + 7d)
+    | summarize
+        LinkClicked = count() > 0,
+        FirstClickTime = min(Timestamp),
+        ClickActions = make_set(ActionType, 20),
+        ClickedUrls = make_set(Url, 20),
+        ClickThroughObserved = max(toint(IsClickedThrough)) == 1
+      by NetworkMessageId, AccountUpn;
+let AttachmentHashes =
+    EmailAttachmentInfo
+    | join kind=inner SuspiciousEmails on NetworkMessageId, RecipientEmailAddress
+    | summarize
+        AttachmentNames = make_set(FileName, 20),
+        AttachmentHashes = make_set(SHA256, 20),
+        AttachmentThreatTypes = make_set(ThreatTypes, 20),
+        AttachmentDetectionMethods = make_set(DetectionMethods, 20)
+      by NetworkMessageId, RecipientEmailAddress;
+let EndpointAttachmentSeen =
+    EmailAttachmentInfo
+    | join kind=inner SuspiciousEmails on NetworkMessageId, RecipientEmailAddress
+    | where isnotempty(SHA256)
+    | distinct NetworkMessageId, RecipientEmailAddress, SHA256
+    | join kind=inner (
+        DeviceFileEvents
+        | where Timestamp between (StartTime .. EndTime + 7d)
+        | where isnotempty(SHA256)
+        | project EndpointSeenTime = Timestamp, DeviceName, SHA256, InitiatingProcessAccountUpn, ActionType
+    ) on SHA256
+    | summarize
+        AttachmentSeenOnEndpoint = count() > 0,
+        EndpointFirstSeen = min(EndpointSeenTime),
+        Devices = make_set(DeviceName, 20),
+        EndpointActions = make_set(ActionType, 20)
+      by NetworkMessageId, RecipientEmailAddress;
+SuspiciousEmails
+| join kind=leftouter LinkClicks on NetworkMessageId
+| join kind=leftouter AttachmentHashes on NetworkMessageId, RecipientEmailAddress
+| join kind=leftouter EndpointAttachmentSeen on NetworkMessageId, RecipientEmailAddress
+| extend
+    LinkClicked = coalesce(LinkClicked, false),
+    ClickThroughObserved = coalesce(ClickThroughObserved, false),
+    AttachmentSeenOnEndpoint = coalesce(AttachmentSeenOnEndpoint, false)
+| project
+    MailTime,
+    RecipientEmailAddress,
+    SenderFromAddress,
+    Subject,
+    DeliveryAction,
+    DeliveryLocation,
+    ThreatTypes,
+    DetectionMethods,
+    AttachmentCount,
+    UrlCount,
+    LinkClicked,
+    FirstClickTime,
+    ClickActions,
+    ClickThroughObserved,
+    AttachmentNames,
+    AttachmentThreatTypes,
+    AttachmentDetectionMethods,
+    AttachmentSeenOnEndpoint,
+    EndpointFirstSeen,
+    Devices,
+    EndpointActions,
+    NetworkMessageId,
+    InternetMessageId
+| order by MailTime desc
