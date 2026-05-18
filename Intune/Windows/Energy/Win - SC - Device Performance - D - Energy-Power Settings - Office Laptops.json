@@ -3,7 +3,7 @@
   "createdDateTime": "2026-05-11T16:14:35.0336951Z",
   "creationSource": null,
   "description": "Configures standardized Windows 11 power and energy management settings for office laptops. The policy balances user experience, battery runtime, and predictable plugged-in behavior by applying appropriate display timeout, sleep/standby, hibernate, Energy Saver threshold, active power scheme, and lid close behavior. Secure wake behavior is enforced by requiring user authentication after resume.",
-  "lastModifiedDateTime": "2026-05-11T16:15:40.7064289Z",
+  "lastModifiedDateTime": "2026-05-18T12:32:24.0316422Z",
   "name": "Win - SC - Device Performance - D - Energy-Power Settings - Office Laptops - v1.1",
   "platforms": "windows10",
   "priorityMetaData": null,
@@ -307,7 +307,7 @@
         "auditRuleInformation": null,
         "choiceSettingValue": {
           "settingValueTemplateReference": null,
-          "value": "device_vendor_msft_policy_config_power_selectlidcloseactionpluggedin_1",
+          "value": "device_vendor_msft_policy_config_power_selectlidcloseactionpluggedin_0",
           "children": []
         }
       }
